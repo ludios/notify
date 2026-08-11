@@ -8,11 +8,12 @@ import "sync"
 
 // nonrecursiveTree TODO(rjeczalik)
 type nonrecursiveTree struct {
-	rw   sync.RWMutex // protects root
-	root root
-	w    watcher
-	c    chan EventInfo
-	rec  chan EventInfo
+	rw        sync.RWMutex // protects root
+	root      root
+	w         watcher
+	c         chan EventInfo
+	rec       chan EventInfo
+	overflowC chan struct{}
 }
 
 // newNonrecursiveTree TODO(rjeczalik)
@@ -21,19 +22,26 @@ func newNonrecursiveTree(w watcher, c, rec chan EventInfo) *nonrecursiveTree {
 		rec = make(chan EventInfo, buffer)
 	}
 	t := &nonrecursiveTree{
-		root: root{nd: newnode("")},
-		w:    w,
-		c:    c,
-		rec:  rec,
+		root:      root{nd: newnode("")},
+		w:         w,
+		c:         c,
+		rec:       rec,
+		overflowC: make(chan struct{}, 1),
 	}
 	go t.dispatch(c)
 	go t.internal(rec)
+	go t.overflowLoop()
 	return t
 }
 
 // dispatch TODO(rjeczalik)
 func (t *nonrecursiveTree) dispatch(c <-chan EventInfo) {
 	for ei := range c {
+		if _, ok := ei.(overflowEvent); ok {
+			dbgprint("dispatch: watcher event queue overflowed")
+			t.scheduleOverflow()
+			continue
+		}
 		dbgprintf("dispatching %v on %q", ei.Event(), ei.Path())
 		go func(ei EventInfo) {
 			var nd node
@@ -307,5 +315,6 @@ func (t *nonrecursiveTree) Stop(c chan<- EventInfo) {
 func (t *nonrecursiveTree) Close() error {
 	err := t.w.Close()
 	close(t.c)
+	close(t.overflowC)
 	return err
 }

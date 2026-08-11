@@ -247,6 +247,9 @@ func (i *inotify) read() (es []*event) {
 // possibly expensive write operations are performed on inotify map.
 func (i *inotify) send(esch <-chan []*event) {
 	for es := range esch {
+		if hasOverflow(es) {
+			i.c <- overflowEvent{}
+		}
 		for _, e := range i.transform(es) {
 			if e != nil {
 				i.c <- e
@@ -254,6 +257,18 @@ func (i *inotify) send(esch <-chan []*event) {
 		}
 	}
 	i.wg.Done()
+}
+
+// hasOverflow reports whether the raw event batch contains an inotify
+// queue overflow notification (IN_Q_OVERFLOW), meaning the kernel dropped
+// an unknown number of events for this inotify instance.
+func hasOverflow(es []*event) bool {
+	for _, e := range es {
+		if e != nil && e.sys.Mask&unix.IN_Q_OVERFLOW != 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // transform prepares events read from inotify file descriptor for sending to
