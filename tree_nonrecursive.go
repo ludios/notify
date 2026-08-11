@@ -43,7 +43,11 @@ func (t *nonrecursiveTree) dispatch(c <-chan EventInfo) {
 			continue
 		}
 		dbgprintf("dispatching %v on %q", ei.Event(), ei.Path())
-		go func(ei EventInfo) {
+		// Keep recursive tree maintenance in filesystem event order. In
+		// particular, a directory can be removed and recreated at the same
+		// pathname. If those events race here, internal may install watches for
+		// the replacement and then remove them while handling the old directory.
+		func(ei EventInfo) {
 			var nd node
 			var isrec bool
 			dir, base := split(ei.Path())

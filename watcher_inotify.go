@@ -25,9 +25,10 @@ import (
 const eventBufferSize = 64 * (unix.SizeofInotifyEvent + unix.PathMax + 1)
 
 // consumersCount defines the number of consumers in producer-consumer based
-// implementation. Each consumer is run in a separate goroutine and has read
-// access to watched files map.
-const consumersCount = 2
+// implementation. Keep this at one: recursive watch bookkeeping relies on the
+// order in which inotify reported directory removals and creations, and multiple
+// consumers can reorder batches before they reach the tree.
+const consumersCount = 1
 
 const invalidDescriptor = -1
 
