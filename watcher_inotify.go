@@ -367,9 +367,7 @@ func decode(mask Event, e *event) (syse *event) {
 // descriptors related to registered path and calls inotify_rm_watch(2) for
 // each. There can be more than one: a directory renamed out of the watched
 // tree keeps its watch under its old path, and a directory created there
-// later gets another.
-// This method is allowed to return EINVAL error when concurrently requested to
-// delete identical path.
+// later gets another. It returns errNotWatched if there are none.
 func (i *inotify) Unwatch(path string) (err error) {
 	var iwds []int32
 	i.RLock()

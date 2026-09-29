@@ -109,6 +109,10 @@ Traverse:
 		names, err := f.Readdirnames(-1)
 		f.Close()
 		if err != nil {
+			// Reading a directory removed since it was opened fails with ENOENT.
+			if gone(nd) {
+				continue Traverse
+			}
 			return err
 		}
 		for _, name := range names {
