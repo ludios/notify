@@ -1,3 +1,4 @@
+// Model-output: Claude Opus 5.5
 // Copyright (c) 2014-2015 The Notify Authors. All rights reserved.
 // Use of this source code is governed by the MIT license that can be
 // found in the LICENSE file.
@@ -276,10 +277,18 @@ func hasOverflow(es []*event) bool {
 // user. It removes invalid events and these which are no longer present in
 // inotify map. This method may also split one raw event into two different ones
 // when system-dependent result is required.
+//
+// IN_IGNORED is the kernel's last event for a watch descriptor (the watched
+// directory was removed, or the watch was removed), so its entry is dropped
+// from the inotify map: otherwise it would linger under the directory's path
+// and Unwatch could later remove the watch of a directory recreated there.
 func (i *inotify) transform(es []*event) []*event {
 	var multi []*event
-	i.RLock()
+	i.Lock()
 	for idx, e := range es {
+		if e.sys.Mask&unix.IN_IGNORED != 0 {
+			delete(i.m, e.sys.Wd)
+		}
 		if e.sys.Mask&(unix.IN_IGNORED|unix.IN_Q_OVERFLOW) != 0 {
 			es[idx] = nil
 			continue
@@ -299,7 +308,7 @@ func (i *inotify) transform(es []*event) []*event {
 			es[idx] = nil
 		}
 	}
-	i.RUnlock()
+	i.Unlock()
 	es = append(es, multi...)
 	return es
 }
@@ -351,31 +360,38 @@ func decode(mask Event, e *event) (syse *event) {
 	return
 }
 
-// Unwatch implements notify.watcher interface. It looks for watch descriptor
-// related to registered path and if found, calls inotify_rm_watch(2) function.
+// Unwatch implements notify.watcher interface. It looks for the watch
+// descriptors related to registered path and calls inotify_rm_watch(2) for
+// each. There can be more than one: a directory renamed out of the watched
+// tree keeps its watch under its old path, and a directory created there
+// later gets another.
 // This method is allowed to return EINVAL error when concurrently requested to
 // delete identical path.
 func (i *inotify) Unwatch(path string) (err error) {
-	iwd := int32(invalidDescriptor)
+	var iwds []int32
 	i.RLock()
-	for iwdkey, wd := range i.m {
+	for iwd, wd := range i.m {
 		if wd.path == path {
-			iwd = iwdkey
-			break
+			iwds = append(iwds, iwd)
 		}
 	}
 	i.RUnlock()
-	if iwd == invalidDescriptor {
+	if len(iwds) == 0 {
 		return errors.New("notify: path " + path + " is already watched")
 	}
 	fd := atomic.LoadInt32(&i.fd)
-	if err = removeInotifyWatch(fd, iwd); err != nil {
-		return
+	for _, iwd := range iwds {
+		if e := removeInotifyWatch(fd, iwd); e != nil {
+			if err == nil {
+				err = e
+			}
+			continue
+		}
+		i.Lock()
+		delete(i.m, iwd)
+		i.Unlock()
 	}
-	i.Lock()
-	delete(i.m, iwd)
-	i.Unlock()
-	return nil
+	return err
 }
 
 // Close implements notify.watcher interface. It removes all existing watch

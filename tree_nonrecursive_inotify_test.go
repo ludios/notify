@@ -26,6 +26,7 @@ type recreateFixture struct {
 	t    *testing.T
 	root string
 	tree *nonrecursiveTree
+	w    *inotify
 	c    chan EventInfo // the user channel
 }
 
@@ -40,9 +41,10 @@ func newRecreateFixture(t *testing.T, dirs ...string) *recreateFixture {
 		}
 	}
 	c := make(chan EventInfo, buffer)
-	tree := newNonrecursiveTree(newWatcher(c), c, nil)
+	w := newWatcher(c).(*inotify)
+	tree := newNonrecursiveTree(w, c, nil)
 	t.Cleanup(func() { tree.Close() })
-	f := &recreateFixture{t: t, root: root, tree: tree, c: make(chan EventInfo, 512)}
+	f := &recreateFixture{t: t, root: root, tree: tree, w: w, c: make(chan EventInfo, 512)}
 	if err := tree.Watch(filepath.Join(root, "..."), f.c, nil, syncthingMask); err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +97,17 @@ func (f *recreateFixture) write(rel string) {
 	f.do(os.WriteFile(f.path(rel), []byte("x"), 0644))
 }
 
+// watchedPaths returns how many inotify descriptors are recorded for each path.
+func (f *recreateFixture) watchedPaths() map[string]int {
+	f.w.RLock()
+	defer f.w.RUnlock()
+	paths := make(map[string]int)
+	for _, wd := range f.w.m {
+		paths[wd.path]++
+	}
+	return paths
+}
+
 // Git's gc deletes emptied .git/objects/xx directories; the next object
 // written there recreates the directory. Everything written into the
 // recreated directory must still be reported.
@@ -132,4 +145,38 @@ func TestRenamedAwayDirPathIsRewatched(t *testing.T) {
 	f.settle()
 	f.write("old/file")
 	f.expectEvent("old/file")
+}
+
+// Removed directories must not leave their descriptors behind.
+func TestRemovedDirForgotten(t *testing.T) {
+	f := newRecreateFixture(t, "gone/deeper")
+	f.do(os.RemoveAll(f.path("gone")))
+	f.settle()
+	paths := f.watchedPaths()
+	for _, rel := range []string{"gone", "gone/deeper"} {
+		if n := paths[f.path(rel)]; n != 0 {
+			t.Errorf("got %d descriptors for removed %s, want 0", n, rel)
+		}
+	}
+}
+
+// Stop must remove every descriptor recorded under a path, including that of
+// a directory renamed out of the watched tree.
+func TestStopUnwatchesAllDescriptorsForPath(t *testing.T) {
+	outside, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := newRecreateFixture(t, "d")
+	f.do(os.Rename(f.path("d"), filepath.Join(outside, "d")))
+	f.settle()
+	f.do(os.Mkdir(f.path("d"), 0755))
+	f.settle()
+	if n := f.watchedPaths()[f.path("d")]; n != 2 {
+		t.Fatalf("got %d descriptors for d, want 2 (renamed-away and recreated)", n)
+	}
+	f.tree.Stop(f.c)
+	if n := f.watchedPaths()[f.path("d")]; n != 0 {
+		t.Fatalf("got %d descriptors for d after Stop, want 0", n)
+	}
 }
