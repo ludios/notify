@@ -1,3 +1,4 @@
+// Model-output: Claude Opus 5.5
 // Copyright (c) 2014-2015 The Notify Authors. All rights reserved.
 // Use of this source code is governed by the MIT license that can be
 // found in the LICENSE file.
@@ -43,9 +44,9 @@ func (t *nonrecursiveTree) overflowLoop() {
 // Directory creation events may have been among the lost ones, in which
 // case the created directories were never watched and all future events
 // below them would be lost as well. Therefore every outermost recursive
-// watchpoint subtree is re-walked, adding watches for any directories
-// missing from the tree (nd.AddDir with t.recFunc is a no-op for already
-// watched directories).
+// watchpoint subtree is re-walked, watching every directory in it
+// (t.rewatchFunc also covers directories recreated at the path of a node
+// left behind by a removed one).
 //
 // Since it is unknown which events were lost, every user channel is then
 // notified with an overflowEvent carrying the path of the node it is
@@ -65,7 +66,7 @@ func (t *nonrecursiveTree) handleOverflow() {
 			subs = append(subs, sub{ch: ch, path: nd.Name})
 		}
 		if eset := nd.Watch[t.rec]; min&recursive == 0 && eset&recursive != 0 {
-			if err := nd.AddDir(t.recFunc(eset), nil); err != nil {
+			if err := nd.AddDir(t.rewatchFunc(eset), nil); err != nil {
 				dbgprintf("overflow re-walk of %q failed: %v", nd.Name, err)
 			}
 		}

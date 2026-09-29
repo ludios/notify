@@ -1,3 +1,4 @@
+// Model-output: Claude Opus 5.5
 // Copyright (c) 2014-2015 The Notify Authors. All rights reserved.
 // Use of this source code is governed by the MIT license that can be
 // found in the LICENSE file.
@@ -122,7 +123,7 @@ func (t *nonrecursiveTree) internal(rec <-chan EventInfo) {
 		if ei.Path() != nd.Name {
 			nd = nd.Add(ei.Path())
 		}
-		err := nd.AddDir(t.recFunc(eset), nil)
+		err := nd.AddDir(t.rewatchFunc(eset), nil)
 		t.rw.Unlock()
 		if err != nil {
 			dbgprintf("internal(%p) error: %v", rec, err)
@@ -230,6 +231,23 @@ func (t *nonrecursiveTree) recFunc(e Event) walkFunc {
 			err = t.w.Rewatch(nd.Name, diff[0], diff[1])
 		}
 		return
+	}
+}
+
+// rewatchFunc is recFunc for directories that may have replaced an earlier
+// directory at the same path: a node outlives the directory it was added for
+// when that is removed or renamed away (Remove handling in internal only runs
+// for watchpoints with the platform-independent Remove event), so recFunc
+// would find a recreated directory's node already watched and never watch it.
+// rewatchFunc always asks the watcher to watch; for inotify, watching a
+// directory that is already watched just returns its existing descriptor.
+func (t *nonrecursiveTree) rewatchFunc(e Event) walkFunc {
+	return func(nd node) error {
+		nd.Watch.Add(t.rec, e|omit|Create)
+		if err := t.w.Watch(nd.Name, nd.Watch.Total()); err != errAlreadyWatched {
+			return err
+		}
+		return nil
 	}
 }
 
