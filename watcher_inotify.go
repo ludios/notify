@@ -92,11 +92,14 @@ func (i *inotify) watch(path string, e Event) (err error) {
 	if err = i.lazyinit(); err != nil {
 		return
 	}
+	// Hold the lock across inotify_add_watch(2) so that transform cannot see
+	// events for the new descriptor before it is in the map, and drop them.
+	i.Lock()
 	iwd, err := unix.InotifyAddWatch(int(i.fd), path, encode(e))
 	if err != nil {
+		i.Unlock()
 		return
 	}
-	i.Lock()
 	if wd, ok := i.m[int32(iwd)]; !ok {
 		i.m[int32(iwd)] = &watched{path: path, mask: uint32(e)}
 	} else {
