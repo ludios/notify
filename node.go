@@ -1,3 +1,4 @@
+// Model-output: Claude Opus 5.5
 // Copyright (c) 2014-2015 The Notify Authors. All rights reserved.
 // Use of this source code is governed by the MIT license that can be
 // found in the LICENSE file.
@@ -8,6 +9,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"syscall"
 )
 
 var errSkip = errors.New("notify: skip")
@@ -38,6 +40,12 @@ func newnode(name string) node {
 	}
 }
 
+// vanished reports whether err means that a path found by an earlier
+// readdir no longer exists, or is no longer a directory.
+func vanished(err error) bool {
+	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+}
+
 func (nd node) addchild(name, base string) node {
 	child, ok := nd.Child[base]
 	if !ok {
@@ -59,14 +67,19 @@ func (nd node) Add(name string) node {
 	return nd.addchild(name, name[i:])
 }
 
+// AddDir calls fn for nd and every directory below it on disk, adding tree
+// nodes for directories that have none. Entries that vanish during the walk
+// (e.g. temporary files renamed into place, directories removed concurrently)
+// are skipped; any other error, or nd itself vanishing, stops the walk.
 func (nd node) AddDir(fn walkFunc, doNotWatch DoNotWatchFn) error {
+	top := nd.Name
 	stack := []node{nd}
 Traverse:
 	for n := len(stack); n != 0; n = len(stack) {
 		nd, stack = stack[n-1], stack[:n-1]
-		switch err := fn(nd); err {
-		case nil:
-		case errSkip:
+		switch err := fn(nd); {
+		case err == nil:
+		case err == errSkip, nd.Name != top && vanished(err):
 			continue Traverse
 		default:
 			return &os.PathError{
@@ -79,11 +92,17 @@ Traverse:
 		// AddDirError and notify users which names are not added to the tree.
 		f, err := os.Open(nd.Name)
 		if err != nil {
+			if nd.Name != top && vanished(err) {
+				continue Traverse
+			}
 			return err
 		}
 		names, err := f.Readdirnames(-1)
 		f.Close()
 		if err != nil {
+			if nd.Name != top && vanished(err) {
+				continue Traverse
+			}
 			return err
 		}
 		for _, name := range names {
@@ -92,6 +111,9 @@ Traverse:
 				continue
 			}
 			fi, err := os.Lstat(name)
+			if vanished(err) {
+				continue
+			}
 			if err != nil {
 				return err
 			}
