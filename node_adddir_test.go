@@ -60,22 +60,44 @@ func TestAddDirSkipsVanishedEntries(t *testing.T) {
 }
 
 // A subdirectory removed after its parent was read is skipped when fn fails
-// on it, but the directory AddDir was called for must still exist.
+// on it, but not a subdirectory that still exists (on kqueue, fn fails when
+// one of the directory's files vanishes), and the directory AddDir was called
+// for must exist.
 func TestAddDirVanishedSubdirAndRoot(t *testing.T) {
 	root := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(root, "sub"), 0755); err != nil {
-		t.Fatal(err)
-	}
 	sub := filepath.Join(root, "sub")
-	fn := func(nd node) error {
+	notFound := &os.PathError{Op: "watch", Path: sub, Err: os.ErrNotExist}
+	mkdir := func() {
+		if err := os.MkdirAll(sub, 0755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	mkdir()
+	removeSub := func(nd node) error {
 		if nd.Name == sub {
-			return &os.PathError{Op: "watch", Path: sub, Err: os.ErrNotExist}
+			if err := os.Remove(sub); err != nil {
+				t.Fatal(err)
+			}
+			return notFound
 		}
 		return nil
 	}
-	if err := newnode(root).AddDir(fn, nil); err != nil {
+	if err := newnode(root).AddDir(removeSub, nil); err != nil {
 		t.Fatalf("AddDir()=%v for vanished subdirectory", err)
 	}
+
+	mkdir()
+	failSub := func(nd node) error {
+		if nd.Name == sub {
+			return notFound
+		}
+		return nil
+	}
+	if err := newnode(root).AddDir(failSub, nil); err == nil {
+		t.Fatal("AddDir()=nil although fn failed on an existing subdirectory")
+	}
+
 	if err := newnode(filepath.Join(root, "missing")).AddDir(func(node) error { return nil }, nil); err == nil {
 		t.Fatal("AddDir()=nil for a missing directory")
 	}

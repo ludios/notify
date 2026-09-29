@@ -46,6 +46,12 @@ func vanished(err error) bool {
 	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
 }
 
+// dirGone reports whether path no longer exists or is no longer a directory.
+func dirGone(path string) bool {
+	fi, err := os.Lstat(path)
+	return vanished(err) || err == nil && !fi.IsDir()
+}
+
 func (nd node) addchild(name, base string) node {
 	child, ok := nd.Child[base]
 	if !ok {
@@ -73,13 +79,16 @@ func (nd node) Add(name string) node {
 // are skipped; any other error, or nd itself vanishing, stops the walk.
 func (nd node) AddDir(fn walkFunc, doNotWatch DoNotWatchFn) error {
 	top := nd.Name
+	// Errors from fn cannot tell which path they are about (on kqueue, fn
+	// also watches the directory's files), so check the directory itself.
+	gone := func(nd node) bool { return nd.Name != top && dirGone(nd.Name) }
 	stack := []node{nd}
 Traverse:
 	for n := len(stack); n != 0; n = len(stack) {
 		nd, stack = stack[n-1], stack[:n-1]
 		switch err := fn(nd); {
 		case err == nil:
-		case err == errSkip, nd.Name != top && vanished(err):
+		case err == errSkip, gone(nd):
 			continue Traverse
 		default:
 			return &os.PathError{
@@ -92,7 +101,7 @@ Traverse:
 		// AddDirError and notify users which names are not added to the tree.
 		f, err := os.Open(nd.Name)
 		if err != nil {
-			if nd.Name != top && vanished(err) {
+			if gone(nd) {
 				continue Traverse
 			}
 			return err
@@ -100,9 +109,6 @@ Traverse:
 		names, err := f.Readdirnames(-1)
 		f.Close()
 		if err != nil {
-			if nd.Name != top && vanished(err) {
-				continue Traverse
-			}
 			return err
 		}
 		for _, name := range names {

@@ -239,15 +239,14 @@ func (t *nonrecursiveTree) recFunc(e Event) walkFunc {
 // when that is removed or renamed away (Remove handling in internal only runs
 // for watchpoints with the platform-independent Remove event), so recFunc
 // would find a recreated directory's node already watched and never watch it.
-// rewatchFunc always asks the watcher to watch; for inotify, watching a
-// directory that is already watched just returns its existing descriptor.
+// rewatchFunc always asks the watcher to watch. inotify watches the directory
+// now at the path (or returns the existing descriptor if it already watches
+// it); the kqueue and FEN watcher keeps its watch per path and still does not
+// notice that the directory was replaced.
 func (t *nonrecursiveTree) rewatchFunc(e Event) walkFunc {
 	return func(nd node) error {
 		nd.Watch.Add(t.rec, e|omit|Create)
-		if err := t.w.Watch(nd.Name, nd.Watch.Total()); err != errAlreadyWatched {
-			return err
-		}
-		return nil
+		return t.w.Watch(nd.Name, nd.Watch.Total())
 	}
 }
 

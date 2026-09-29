@@ -380,7 +380,7 @@ func (i *inotify) Unwatch(path string) (err error) {
 	}
 	i.RUnlock()
 	if len(iwds) == 0 {
-		return errors.New("notify: path " + path + " is already watched")
+		return errNotWatched
 	}
 	fd := atomic.LoadInt32(&i.fd)
 	for _, iwd := range iwds {

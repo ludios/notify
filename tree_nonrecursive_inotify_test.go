@@ -55,32 +55,41 @@ func (f *recreateFixture) path(rel string) string {
 	return filepath.Join(f.root, rel)
 }
 
-// settle waits for the watcher and the tree's recursive bookkeeping to
-// catch up, then discards the events delivered so far.
-func (f *recreateFixture) settle() {
-	time.Sleep(200 * time.Millisecond)
-	for {
-		select {
-		case <-f.c:
-		default:
-			return
-		}
-	}
-}
+// deadline bounds how long the tests wait for the watcher and the tree's
+// recursive bookkeeping, which run asynchronously.
+const deadline = 5 * time.Second
 
-// expectEvent fails unless an event for rel arrives.
-func (f *recreateFixture) expectEvent(rel string) {
+// writeUntilEvent writes rel until an event for it arrives, failing if none
+// does before the deadline: a directory created moments ago may not be
+// watched yet, but it must be eventually.
+func (f *recreateFixture) writeUntilEvent(rel string) {
 	f.t.Helper()
 	want := f.path(rel)
-	deadline := time.After(2 * time.Second)
-	for {
-		select {
-		case ei := <-f.c:
-			if ei.Path() == want {
-				return
+	end := time.Now().Add(deadline)
+	for time.Now().Before(end) {
+		f.write(rel)
+		wait := time.After(100 * time.Millisecond)
+	Drain:
+		for {
+			select {
+			case ei := <-f.c:
+				if ei.Path() == want {
+					return
+				}
+			case <-wait:
+				break Drain
 			}
-		case <-deadline:
-			f.t.Fatalf("no event for %s", rel)
+		}
+	}
+	f.t.Fatalf("no event for %s", rel)
+}
+
+// waitFor fails unless cond becomes true before the deadline.
+func (f *recreateFixture) waitFor(what string, cond func() bool) {
+	f.t.Helper()
+	for end := time.Now().Add(deadline); !cond(); time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(end) {
+			f.t.Fatalf("timed out waiting for %s", what)
 		}
 	}
 }
@@ -114,11 +123,8 @@ func (f *recreateFixture) watchedPaths() map[string]int {
 func TestRecreatedDirIsWatched(t *testing.T) {
 	f := newRecreateFixture(t, "objects/ab")
 	f.do(os.RemoveAll(f.path("objects/ab")))
-	f.settle()
 	f.do(os.Mkdir(f.path("objects/ab"), 0755))
-	f.settle()
-	f.write("objects/ab/obj")
-	f.expectEvent("objects/ab/obj")
+	f.writeUntilEvent("objects/ab/obj")
 }
 
 // A subdirectory whose path existed before must be watched as well when its
@@ -126,42 +132,33 @@ func TestRecreatedDirIsWatched(t *testing.T) {
 func TestRecreatedTreeIsWatched(t *testing.T) {
 	f := newRecreateFixture(t, "a/b/c")
 	f.do(os.RemoveAll(f.path("a")))
-	f.settle()
 	f.do(os.MkdirAll(f.path("a/b/c"), 0755))
-	f.settle()
-	f.write("a/b/c/file")
-	f.expectEvent("a/b/c/file")
+	f.writeUntilEvent("a/b/c/file")
 }
 
-// A directory renamed away keeps its watch; a directory later created at its
-// old path must get one too, and events must carry the renamed path.
-func TestRenamedAwayDirPathIsRewatched(t *testing.T) {
+// A directory renamed within the tree keeps its watch, now under its new
+// path; a directory later created at its old path must be watched too.
+func TestRenamedDirPathIsRewatched(t *testing.T) {
 	f := newRecreateFixture(t, "old/sub")
 	f.do(os.Rename(f.path("old"), f.path("new")))
-	f.settle()
-	f.write("new/sub/file")
-	f.expectEvent("new/sub/file")
+	f.writeUntilEvent("new/sub/file")
 	f.do(os.Mkdir(f.path("old"), 0755))
-	f.settle()
-	f.write("old/file")
-	f.expectEvent("old/file")
+	f.writeUntilEvent("old/file")
 }
 
 // Removed directories must not leave their descriptors behind.
 func TestRemovedDirForgotten(t *testing.T) {
 	f := newRecreateFixture(t, "gone/deeper")
 	f.do(os.RemoveAll(f.path("gone")))
-	f.settle()
-	paths := f.watchedPaths()
-	for _, rel := range []string{"gone", "gone/deeper"} {
-		if n := paths[f.path(rel)]; n != 0 {
-			t.Errorf("got %d descriptors for removed %s, want 0", n, rel)
-		}
-	}
+	f.waitFor("descriptors of removed directories to be dropped", func() bool {
+		paths := f.watchedPaths()
+		return paths[f.path("gone")] == 0 && paths[f.path("gone/deeper")] == 0
+	})
 }
 
-// Stop must remove every descriptor recorded under a path, including that of
-// a directory renamed out of the watched tree.
+// A directory renamed out of the tree keeps its watch under its old path
+// (notify cannot follow it there), and a directory created in its place gets
+// another. Stop must remove both.
 func TestStopUnwatchesAllDescriptorsForPath(t *testing.T) {
 	outside, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -169,12 +166,8 @@ func TestStopUnwatchesAllDescriptorsForPath(t *testing.T) {
 	}
 	f := newRecreateFixture(t, "d")
 	f.do(os.Rename(f.path("d"), filepath.Join(outside, "d")))
-	f.settle()
 	f.do(os.Mkdir(f.path("d"), 0755))
-	f.settle()
-	if n := f.watchedPaths()[f.path("d")]; n != 2 {
-		t.Fatalf("got %d descriptors for d, want 2 (renamed-away and recreated)", n)
-	}
+	f.waitFor("the recreated d to be watched", func() bool { return f.watchedPaths()[f.path("d")] == 2 })
 	f.tree.Stop(f.c)
 	if n := f.watchedPaths()[f.path("d")]; n != 0 {
 		t.Fatalf("got %d descriptors for d after Stop, want 0", n)
