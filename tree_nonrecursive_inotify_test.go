@@ -9,6 +9,7 @@
 package notify
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -187,5 +188,30 @@ func TestNewDirKeepsFilter(t *testing.T) {
 	paths := f.watchedPaths()
 	if paths[f.path("ign")] != 0 || paths[f.path("ign/deep")] != 0 {
 		t.Fatalf("excluded directories are watched: %v", paths)
+	}
+}
+
+// A directory created in the tree that cannot be watched must be reported
+// with a WatchError.
+func TestNewDirWatchError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can watch unreadable directories")
+	}
+	f := newRecreateFixture(t, nil)
+	locked := f.path("locked")
+	f.do(os.Mkdir(locked, 0))
+	defer os.Chmod(locked, 0755)
+	for end := time.After(deadline); ; {
+		select {
+		case ei := <-f.c:
+			if werr, ok := ei.(*WatchError); ok {
+				if werr.Path() != locked || !errors.Is(werr.Err, os.ErrPermission) {
+					t.Fatalf("got WatchError %v", werr.Err)
+				}
+				return
+			}
+		case <-end:
+			t.Fatal("no WatchError")
+		}
 	}
 }

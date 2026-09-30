@@ -129,8 +129,10 @@ func (t *nonrecursiveTree) internal(rec <-chan EventInfo) {
 // But it holds t.rw only while changing the tree and the watcher, not while
 // reading directories, so that events keep being dispatched meanwhile; the
 // tree is looked at afresh for each directory. A directory that cannot be
-// watched or read is skipped.
+// watched or read is skipped, and reported to the recursive watches wanting
+// it, each at most once.
 func (t *nonrecursiveTree) watchTree(dir string) {
+	reported := make(map[chan<- EventInfo]bool)
 	stack := []string{dir}
 	for n := len(stack); n != 0; n = len(stack) {
 		dir, stack = stack[n-1], stack[:n-1]
@@ -141,7 +143,7 @@ func (t *nonrecursiveTree) watchTree(dir string) {
 		}
 		if err != nil {
 			if err != errSkip && !dirGone(dir) {
-				dbgprintf("watchTree: %v", err)
+				t.report(dir, err, reported)
 			}
 			continue
 		}
@@ -151,12 +153,36 @@ func (t *nonrecursiveTree) watchTree(dir string) {
 	}
 }
 
+// report sends a WatchError for err, which watching or reading dir failed
+// with, to the channels of the recursive watches wanting dir, unless reported
+// says one was sent there before. It notes the channels sent to in reported.
+func (t *nonrecursiveTree) report(dir string, err error, reported map[chan<- EventInfo]bool) {
+	pathErr, ok := err.(*os.PathError)
+	if !ok {
+		pathErr = &os.PathError{Op: "read", Path: dir, Err: err}
+	}
+	dbgprintf("watchTree: %v", pathErr)
+	t.rw.Lock()
+	defer t.rw.Unlock()
+	for _, c := range t.wanting(dir) {
+		if reported[c] {
+			continue
+		}
+		reported[c] = true
+		select {
+		case c <- &WatchError{Err: pathErr}:
+		default:
+			dbgprintf("WatchError for %q dropped: receiver too slow", dir)
+		}
+	}
+}
+
 // watchDir watches dir and adds its node to the tree if a recursive watch
-// wants it (see wanted), and returns errSkip if none does.
+// wants it (see wanting), and returns errSkip if none does.
 func (t *nonrecursiveTree) watchDir(dir string) error {
 	t.rw.Lock()
 	defer t.rw.Unlock()
-	if !t.wanted(dir) {
+	if len(t.wanting(dir)) == 0 {
 		return errSkip
 	}
 	var nd node
@@ -180,17 +206,19 @@ func (t *nonrecursiveTree) watchDir(dir string) error {
 	return nil
 }
 
-// wanted reports whether dir is in the tree of a recursive watch: it is the
-// watch's directory, or below it and not excluded by its DoNotWatchFn. So
-// directories are watched unless every recursive watch they are below
-// excludes them. t.rw must be held.
-func (t *nonrecursiveTree) wanted(dir string) bool {
+// wanting returns the channels of the recursive watches that have dir in
+// their tree: dir is the watch's directory, or below it and not excluded by
+// its DoNotWatchFn. So directories are watched unless every recursive watch
+// they are below excludes them. t.rw must be held for writing, as the
+// DoNotWatchFns need not be safe for concurrent use.
+func (t *nonrecursiveTree) wanting(dir string) []chan<- EventInfo {
+	var cs []chan<- EventInfo
 	for rw, doNotWatch := range t.filters {
 		if dir == rw.path || indexrel(rw.path, dir) != -1 && (doNotWatch == nil || !doNotWatch(dir)) {
-			return true
+			cs = append(cs, rw.c)
 		}
 	}
-	return false
+	return cs
 }
 
 // watchAdd TODO(rjeczalik)

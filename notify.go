@@ -1,3 +1,4 @@
+// Model-output: Claude Opus 5.5
 // Copyright (c) 2014-2015 The Notify Authors. All rights reserved.
 // Use of this source code is governed by the MIT license that can be
 // found in the LICENSE file.
@@ -18,6 +19,8 @@
 // triggers FileActionModified event. (to discuss see #75).
 
 package notify
+
+import "os"
 
 var defaultTree = newTree()
 
@@ -62,6 +65,14 @@ type DoNotWatchFn func(string) bool
 // mind this limitation while setting recursive watchpoints for your application,
 // e.g. use persistent paths like %userprofile% or watch additionally parent
 // directory of a recursive watchpoint in order to receive delete events for it.
+//
+// # Directories that cannot be watched later
+//
+// Where the OS watches directories one by one (e.g. inotify), a recursive
+// watchpoint watches directories that appear in its tree after Watch returned.
+// If one cannot be watched or read, e.g. because the inotify watch limit was
+// reached, c is sent a *WatchError, and changes below that directory may go
+// unreported.
 func Watch(path string, c chan<- EventInfo, events ...Event) error {
 	return defaultTree.Watch(path, c, nil, events...)
 }
@@ -74,6 +85,19 @@ func WatchWithFilter(path string, c chan<- EventInfo,
 	doNotWatch func(string) bool, events ...Event) error {
 	return defaultTree.Watch(path, c, doNotWatch, events...)
 }
+
+// WatchError is sent, in place of an event, on the channel of a recursive
+// watchpoint when a directory in its tree could not be watched or read after
+// Watch returned. Changes below the directory may go unreported from then on.
+// Such a channel is sent one WatchError at most for each time directories
+// are looked for in the tree (see Watch).
+type WatchError struct {
+	Err *os.PathError // what failed, for which directory
+}
+
+func (e *WatchError) Event() Event     { return 0 }
+func (e *WatchError) Path() string     { return e.Err.Path }
+func (e *WatchError) Sys() interface{} { return nil }
 
 // Stop removes all watchpoints registered for c. All underlying watches are
 // also removed, for which c was the last channel listening for events.
