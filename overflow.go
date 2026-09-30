@@ -44,43 +44,41 @@ func (t *nonrecursiveTree) overflowLoop() {
 // Directory creation events may have been among the lost ones, in which
 // case the created directories were never watched and all future events
 // below them would be lost as well. Therefore every outermost recursive
-// watchpoint subtree is re-walked, watching every directory in it
-// (t.rewatchFunc also covers directories recreated at the path of a node
-// left behind by a removed one).
+// watchpoint's tree is walked again with watchTree, watching every
+// directory in it (rewatchFunc also covers directories recreated at the
+// path of a node left behind by a removed one).
 //
 // Since it is unknown which events were lost, every user channel is then
 // notified with an overflowEvent carrying the path of the node it is
-// registered at, prompting a rescan of that subtree.
+// registered at, prompting a rescan of that subtree. That happens under
+// t.rw, so that no channel is notified once Stop for it has returned.
 func (t *nonrecursiveTree) handleOverflow() {
-	type sub struct {
-		ch   chan<- EventInfo
-		path string
+	var roots []string
+	t.rw.RLock()
+	t.walkWatchpoint(t.root.nd, func(min Event, nd node) error {
+		if eset := nd.Watch[t.rec]; min&recursive == 0 && eset&recursive != 0 {
+			roots = append(roots, nd.Name)
+		}
+		return nil
+	})
+	t.rw.RUnlock()
+	for _, root := range roots {
+		t.watchTree(root)
 	}
-	var subs []sub
-	t.rw.Lock()
-	err := t.walkWatchpoint(t.root.nd, func(min Event, nd node) error {
+
+	t.rw.RLock()
+	defer t.rw.RUnlock()
+	t.walkWatchpoint(t.root.nd, func(_ Event, nd node) error {
 		for ch := range nd.Watch {
 			if ch == nil || ch == t.rec {
 				continue
 			}
-			subs = append(subs, sub{ch: ch, path: nd.Name})
-		}
-		if eset := nd.Watch[t.rec]; min&recursive == 0 && eset&recursive != 0 {
-			if err := nd.AddDir(t.rewatchFunc(eset), nil); err != nil {
-				dbgprintf("overflow re-walk of %q failed: %v", nd.Name, err)
+			select {
+			case ch <- overflowEvent{path: nd.Name}:
+			default:
+				dbgprintf("overflow notification dropped for %q: receiver too slow", nd.Name)
 			}
 		}
 		return nil
 	})
-	t.rw.Unlock()
-	if err != nil {
-		dbgprintf("overflow tree walk error: %v", err)
-	}
-	for _, s := range subs {
-		select {
-		case s.ch <- overflowEvent{path: s.path}:
-		default:
-			dbgprintf("overflow notification dropped for %q: receiver too slow", s.path)
-		}
-	}
 }

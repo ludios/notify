@@ -5,7 +5,11 @@
 
 package notify
 
-import "sync"
+import (
+	"os"
+	"path/filepath"
+	"sync"
+)
 
 // nonrecursiveTree TODO(rjeczalik)
 type nonrecursiveTree struct {
@@ -92,8 +96,8 @@ func (t *nonrecursiveTree) dispatch(c <-chan EventInfo) {
 // internal TODO(rjeczalik)
 func (t *nonrecursiveTree) internal(rec <-chan EventInfo) {
 	for ei := range rec {
-		t.rw.Lock()
 		if ei.Event() == Remove {
+			t.rw.Lock()
 			nd, err := t.root.Get(ei.Path())
 			if err != nil {
 				t.rw.Unlock()
@@ -107,28 +111,61 @@ func (t *nonrecursiveTree) internal(rec <-chan EventInfo) {
 			t.rw.Unlock()
 			continue
 		}
-		var nd node
-		var eset = internal
-		t.root.WalkPath(ei.Path(), func(it node, _ bool) error {
-			if e := it.Watch[t.rec]; e != 0 && e > eset {
-				eset = e
+		t.watchTree(ei.Path())
+	}
+}
+
+// watchTree watches dir and every directory below it in a recursive
+// watchpoint's tree, adding their nodes, as AddDir with rewatchFunc would.
+// But it holds t.rw only while changing the tree and the watcher, not while
+// reading directories, so that events keep being dispatched meanwhile; the
+// tree is looked at afresh for each directory. A directory that cannot be
+// watched or read is skipped.
+func (t *nonrecursiveTree) watchTree(dir string) {
+	stack := []string{dir}
+	for n := len(stack); n != 0; n = len(stack) {
+		dir, stack = stack[n-1], stack[:n-1]
+		var names []string
+		err := t.watchDir(dir)
+		if err == nil {
+			names, err = subdirs(dir)
+		}
+		if err != nil {
+			if err != errSkip && !dirGone(dir) {
+				dbgprintf("watchTree: %v", err)
 			}
-			nd = it
-			return nil
-		})
-		if eset == internal {
-			t.rw.Unlock()
 			continue
 		}
-		if ei.Path() != nd.Name {
-			nd = nd.Add(ei.Path())
-		}
-		err := nd.AddDir(t.rewatchFunc(eset), nil)
-		t.rw.Unlock()
-		if err != nil {
-			dbgprintf("internal(%p) error: %v", rec, err)
+		for _, name := range names {
+			stack = append(stack, filepath.Join(dir, name))
 		}
 	}
+}
+
+// watchDir watches dir and adds its node to the tree if dir is in a recursive
+// watchpoint's tree, and returns errSkip if it is not.
+func (t *nonrecursiveTree) watchDir(dir string) error {
+	t.rw.Lock()
+	defer t.rw.Unlock()
+	var nd node
+	eset := internal
+	t.root.WalkPath(dir, func(it node, _ bool) error {
+		if e := it.Watch[t.rec]; e != 0 && e > eset {
+			eset = e
+		}
+		nd = it
+		return nil
+	})
+	if eset == internal {
+		return errSkip
+	}
+	if dir != nd.Name {
+		nd = nd.Add(dir)
+	}
+	if err := t.rewatchFunc(eset)(nd); err != nil {
+		return &os.PathError{Op: "watch", Path: dir, Err: err}
+	}
+	return nil
 }
 
 // watchAdd TODO(rjeczalik)
