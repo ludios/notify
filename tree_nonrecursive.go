@@ -13,12 +13,20 @@ import (
 
 // nonrecursiveTree TODO(rjeczalik)
 type nonrecursiveTree struct {
-	rw        sync.RWMutex // protects root
+	rw        sync.RWMutex // protects root and filters
 	root      root
 	w         watcher
 	c         chan EventInfo
 	rec       chan EventInfo
 	overflowC chan struct{}
+	filters   map[recwatch]DoNotWatchFn // of every recursive watch; nil for none
+}
+
+// recwatch is a recursive watch set up by Watch: the directory it was asked
+// for, and the channel it sends to.
+type recwatch struct {
+	path string
+	c    chan<- EventInfo
 }
 
 // newNonrecursiveTree TODO(rjeczalik)
@@ -32,6 +40,7 @@ func newNonrecursiveTree(w watcher, c, rec chan EventInfo) *nonrecursiveTree {
 		c:         c,
 		rec:       rec,
 		overflowC: make(chan struct{}, 1),
+		filters:   make(map[recwatch]DoNotWatchFn),
 	}
 	go t.dispatch(c)
 	go t.internal(rec)
@@ -142,11 +151,14 @@ func (t *nonrecursiveTree) watchTree(dir string) {
 	}
 }
 
-// watchDir watches dir and adds its node to the tree if dir is in a recursive
-// watchpoint's tree, and returns errSkip if it is not.
+// watchDir watches dir and adds its node to the tree if a recursive watch
+// wants it (see wanted), and returns errSkip if none does.
 func (t *nonrecursiveTree) watchDir(dir string) error {
 	t.rw.Lock()
 	defer t.rw.Unlock()
+	if !t.wanted(dir) {
+		return errSkip
+	}
 	var nd node
 	eset := internal
 	t.root.WalkPath(dir, func(it node, _ bool) error {
@@ -166,6 +178,19 @@ func (t *nonrecursiveTree) watchDir(dir string) error {
 		return &os.PathError{Op: "watch", Path: dir, Err: err}
 	}
 	return nil
+}
+
+// wanted reports whether dir is in the tree of a recursive watch: it is the
+// watch's directory, or below it and not excluded by its DoNotWatchFn. So
+// directories are watched unless every recursive watch they are below
+// excludes them. t.rw must be held.
+func (t *nonrecursiveTree) wanted(dir string) bool {
+	for rw, doNotWatch := range t.filters {
+		if dir == rw.path || indexrel(rw.path, dir) != -1 && (doNotWatch == nil || !doNotWatch(dir)) {
+			return true
+		}
+	}
+	return false
 }
 
 // watchAdd TODO(rjeczalik)
@@ -230,7 +255,11 @@ func (t *nonrecursiveTree) Watch(path string, c chan<- EventInfo,
 	defer t.rw.Unlock()
 	nd := t.root.Add(path)
 	if isrec {
-		return t.watchrec(nd, c, eset|recursive, doNotWatch)
+		if err := t.watchrec(nd, c, eset|recursive, doNotWatch); err != nil {
+			return err
+		}
+		t.filters[recwatch{path: nd.Name, c: c}] = doNotWatch
+		return nil
 	}
 	return t.watch(nd, c, eset)
 }
@@ -363,6 +392,11 @@ func (t *nonrecursiveTree) Stop(c chan<- EventInfo) {
 	}
 	t.rw.Lock()
 	err := t.walkWatchpoint(t.root.nd, fn) // TODO(rjeczalik): store max root per c
+	for rw := range t.filters {
+		if rw.c == c {
+			delete(t.filters, rw)
+		}
+	}
 	t.rw.Unlock()
 	dbgprintf("Stop(%p) error: %v\n", c, err)
 }

@@ -1,3 +1,4 @@
+// Model-output: Claude Opus 5.5
 // Copyright (c) 2014-2015 The Notify Authors. All rights reserved.
 // Use of this source code is governed by the MIT license that can be
 // found in the LICENSE file.
@@ -11,71 +12,114 @@ import (
 	"time"
 )
 
+// newSpyTree returns a non-recursive tree over a Spy watcher and the channel
+// the watcher would send to. The Spy records Watch calls and never delivers
+// filesystem events, which deterministically simulates the events for
+// directories created after watching being lost in a queue overflow.
+func newSpyTree(t *testing.T) (*nonrecursiveTree, *Spy, chan EventInfo) {
+	spy := &Spy{}
+	c := make(chan EventInfo, buffer)
+	tr := newNonrecursiveTree(spy, c, nil)
+	t.Cleanup(func() { tr.Close() })
+	return tr, spy, c
+}
+
+// overflow simulates the watcher's event queue overflowing by sending to c,
+// and returns what user got up to and including its overflow notification.
+func overflow(t *testing.T, c, user chan EventInfo) []EventInfo {
+	t.Helper()
+	c <- overflowEvent{}
+	var got []EventInfo
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case ei := <-user:
+			got = append(got, ei)
+			if _, ok := ei.(overflowEvent); ok {
+				return got
+			}
+		case <-timeout:
+			t.Fatalf("timed out waiting for overflow notification; got %v", got)
+		}
+	}
+}
+
+// spyWatched reports whether spy was asked to watch path.
+func spyWatched(spy *Spy, path string) bool {
+	for _, call := range *spy {
+		if call.F == FuncWatch && call.P == path {
+			return true
+		}
+	}
+	return false
+}
+
+func mkdirs(t *testing.T, root string, dirs ...string) {
+	t.Helper()
+	for _, d := range dirs {
+		if err := os.MkdirAll(filepath.Join(root, d), 0777); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // TestOverflow verifies recovery from a watcher event queue overflow
 // (e.g. inotify IN_Q_OVERFLOW): directories created while events were
 // being lost must get watched retroactively, and every user channel must
 // receive an overflowEvent for the subtree it is registered at, so that
 // callers can rescan.
-//
-// A Spy watcher is used instead of a real one: it records Watch calls and
-// never delivers filesystem events, which deterministically simulates the
-// "mkdir event was lost" scenario for the directory created in step 3.
 func TestOverflow(t *testing.T) {
-	tmp, err := os.MkdirTemp("", "overflow")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmp)
-	if err := os.Mkdir(filepath.Join(tmp, "a"), 0777); err != nil {
-		t.Fatal(err)
-	}
-
-	spy := &Spy{}
-	c := make(chan EventInfo, buffer)
-	tr := newNonrecursiveTree(spy, c, nil)
-	defer tr.Close()
-
+	tmp := t.TempDir()
+	mkdirs(t, tmp, "a")
+	tr, spy, c := newSpyTree(t)
 	userCh := make(chan EventInfo, 16)
 	if err := tr.Watch(tmp+"/...", userCh, nil, All); err != nil {
 		t.Fatalf("Watch(%q)=%v", tmp, err)
 	}
 
-	// Created after the initial walk; the Spy delivers no event for it,
-	// simulating a mkdir notification lost in a queue overflow.
+	// Created after the initial walk, so as if its mkdir event was lost.
 	lost := filepath.Join(tmp, "b")
-	if err := os.Mkdir(lost, 0777); err != nil {
-		t.Fatal(err)
-	}
-	for _, call := range *spy {
-		if call.F == FuncWatch && call.P == lost {
-			t.Fatalf("%q watched before overflow handling; test is broken", lost)
-		}
+	mkdirs(t, tmp, "b")
+	if spyWatched(spy, lost) {
+		t.Fatalf("%q watched before overflow handling; test is broken", lost)
 	}
 
-	c <- overflowEvent{}
-
-	select {
-	case ei := <-userCh:
-		if _, ok := ei.(overflowEvent); !ok {
-			t.Fatalf("want overflowEvent; got %v on %q", ei.Event(), ei.Path())
-		}
-		if ei.Path() == "" {
-			t.Fatal("overflow notification carries no path")
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for overflow notification")
+	got := overflow(t, c, userCh)
+	if len(got) != 1 || got[0].Path() != tmp {
+		t.Fatalf("got %v; want only an overflow notification for %q", got, tmp)
 	}
-
 	// The overflow notification is sent after the re-walk completed, so
 	// the repair watch must have been recorded by now.
-	watched := false
-	for _, call := range *spy {
-		if call.F == FuncWatch && call.P == lost {
-			watched = true
-			break
+	if !spyWatched(spy, lost) {
+		t.Fatalf("%q was not watched during overflow recovery; calls: %v", lost, *spy)
+	}
+}
+
+// The overflow re-walk must leave out what the recursive watch's DoNotWatchFn
+// excludes, as watching did, but not what another recursive watch wants.
+func TestOverflowKeepsFilter(t *testing.T) {
+	tmp := t.TempDir()
+	tr, spy, c := newSpyTree(t)
+	userCh := make(chan EventInfo, 16)
+	doNotWatch := func(p string) bool { return filepath.Base(p) == "ign" }
+	if err := tr.Watch(tmp+"/...", userCh, doNotWatch, All); err != nil {
+		t.Fatal(err)
+	}
+	other := filepath.Join(tmp, "other")
+	mkdirs(t, tmp, "ign/deep", "keep", "other/ign")
+	if err := tr.Watch(other+"/...", make(chan EventInfo, 16), nil, All); err != nil {
+		t.Fatal(err)
+	}
+
+	overflow(t, c, userCh)
+	for _, d := range []string{"ign", "ign/deep"} {
+		if p := filepath.Join(tmp, d); spyWatched(spy, p) {
+			t.Errorf("%q is excluded but was watched", p)
 		}
 	}
-	if !watched {
-		t.Fatalf("%q was not watched during overflow recovery; calls: %v", lost, *spy)
+	for _, d := range []string{"keep", "other/ign"} {
+		if p := filepath.Join(tmp, d); !spyWatched(spy, p) {
+			t.Errorf("%q was not watched", p)
+		}
 	}
 }
