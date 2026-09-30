@@ -32,7 +32,7 @@ func (t *nonrecursiveTree) scheduleOverflow() {
 
 // overflowLoop runs overflow handling outside the dispatch loop, so that
 // event dispatching (and thus the watcher's send goroutine) is never
-// blocked on the filesystem re-walk. It exits when overflowC is closed.
+// blocked on the filesystem re-walk. It exits when dispatch closes overflowC.
 func (t *nonrecursiveTree) overflowLoop() {
 	for range t.overflowC {
 		t.handleOverflow()
@@ -68,6 +68,9 @@ func (t *nonrecursiveTree) handleOverflow() {
 
 	t.rw.RLock()
 	defer t.rw.RUnlock()
+	if t.closed {
+		return
+	}
 	t.walkWatchpoint(t.root.nd, func(_ Event, nd node) error {
 		for ch := range nd.Watch {
 			if ch == nil || ch == t.rec {

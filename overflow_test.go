@@ -180,3 +180,32 @@ func TestOverflowReportsWatchErrors(t *testing.T) {
 		t.Error("the walk stopped at a failing directory")
 	}
 }
+
+// Closing the tree while the watcher's channel still holds overflow events
+// must not panic, and must stop overflow handling from watching directories
+// or notifying channels.
+func TestCloseDuringOverflow(t *testing.T) {
+	tmp := t.TempDir()
+	for i := 0; i < 100; i++ {
+		tr, _, c := newSpyTree(t)
+		for len(c) < cap(c) {
+			c <- overflowEvent{}
+		}
+		tr.Close()
+	}
+
+	tr, spy, _ := newSpyTree(t)
+	userCh := make(chan EventInfo, 16)
+	if err := tr.Watch(tmp+"/...", userCh, nil, All); err != nil {
+		t.Fatal(err)
+	}
+	mkdirs(t, tmp, "new")
+	tr.Close()
+	tr.handleOverflow()
+	if spyWatched(spy, filepath.Join(tmp, "new")) {
+		t.Error("a directory was watched after Close")
+	}
+	if len(userCh) != 0 {
+		t.Errorf("got %v after Close", <-userCh)
+	}
+}

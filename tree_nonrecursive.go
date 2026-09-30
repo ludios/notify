@@ -13,13 +13,14 @@ import (
 
 // nonrecursiveTree TODO(rjeczalik)
 type nonrecursiveTree struct {
-	rw        sync.RWMutex // protects root and filters
+	rw        sync.RWMutex // protects root, filters and closed
 	root      root
 	w         watcher
 	c         chan EventInfo
 	rec       chan EventInfo
-	overflowC chan struct{}
+	overflowC chan struct{}             // closed by dispatch, its only sender
 	filters   map[recwatch]DoNotWatchFn // of every recursive watch; nil for none
+	closed    bool                      // set by Close
 }
 
 // recwatch is a recursive watch set up by Watch: the directory it was asked
@@ -100,6 +101,7 @@ func (t *nonrecursiveTree) dispatch(c <-chan EventInfo) {
 			t.rec <- ei
 		}(ei)
 	}
+	close(t.overflowC)
 }
 
 // internal TODO(rjeczalik)
@@ -178,11 +180,11 @@ func (t *nonrecursiveTree) report(dir string, err error, reported map[chan<- Eve
 }
 
 // watchDir watches dir and adds its node to the tree if a recursive watch
-// wants it (see wanting), and returns errSkip if none does.
+// wants it (see wanting), and returns errSkip if none does or t is closed.
 func (t *nonrecursiveTree) watchDir(dir string) error {
 	t.rw.Lock()
 	defer t.rw.Unlock()
-	if len(t.wanting(dir)) == 0 {
+	if t.closed || len(t.wanting(dir)) == 0 {
 		return errSkip
 	}
 	var nd node
@@ -429,10 +431,18 @@ func (t *nonrecursiveTree) Stop(c chan<- EventInfo) {
 	dbgprintf("Stop(%p) error: %v\n", c, err)
 }
 
-// Close TODO(rjeczalik)
+// Close closes the watcher, unless it was before; directories that appear or
+// are found by an overflow re-walk afterwards are not watched, lest the
+// watcher start anew.
 func (t *nonrecursiveTree) Close() error {
+	t.rw.Lock()
+	closed := t.closed
+	t.closed = true
+	t.rw.Unlock()
+	if closed {
+		return nil
+	}
 	err := t.w.Close()
 	close(t.c)
-	close(t.overflowC)
 	return err
 }
