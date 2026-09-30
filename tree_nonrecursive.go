@@ -6,8 +6,10 @@
 package notify
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 )
 
@@ -134,58 +136,73 @@ func (t *nonrecursiveTree) internal(rec <-chan EventInfo) {
 // watched or read is skipped, and reported to the recursive watches wanting
 // it, each at most once.
 func (t *nonrecursiveTree) watchTree(dir string) {
+	type todo struct {
+		dir    string
+		parent []recwatch // the recursive watches wanting dir's parent, if walked
+	}
 	reported := make(map[chan<- EventInfo]bool)
-	stack := []string{dir}
+	stack := []todo{{dir: dir}}
 	for n := len(stack); n != 0; n = len(stack) {
-		dir, stack = stack[n-1], stack[:n-1]
+		it := stack[n-1]
+		stack = stack[:n-1]
+		rws, err := t.watchDir(it.dir, it.parent)
+		// On kqueue and FEN, watching a directory also watches the files in
+		// it, and fails if one of them vanishes meanwhile.
+		for try := 1; try < 3 && errors.Is(err, os.ErrNotExist) && !dirGone(it.dir); try++ {
+			rws, err = t.watchDir(it.dir, it.parent)
+		}
 		var names []string
-		err := t.watchDir(dir)
 		if err == nil {
-			names, err = subdirs(dir)
+			names, err = subdirs(it.dir)
 		}
 		if err != nil {
-			if err != errSkip && !dirGone(dir) {
-				t.report(dir, err, reported)
+			if err != errSkip && !dirGone(it.dir) {
+				t.report(it.dir, err, rws, reported)
 			}
 			continue
 		}
 		for _, name := range names {
-			stack = append(stack, filepath.Join(dir, name))
+			stack = append(stack, todo{dir: filepath.Join(it.dir, name), parent: rws})
 		}
 	}
 }
 
 // report sends a WatchError for err, which watching or reading dir failed
-// with, to the channels of the recursive watches wanting dir, unless reported
-// says one was sent there before. It notes the channels sent to in reported.
-func (t *nonrecursiveTree) report(dir string, err error, reported map[chan<- EventInfo]bool) {
-	pathErr, ok := err.(*os.PathError)
-	if !ok {
-		pathErr = &os.PathError{Op: "read", Path: dir, Err: err}
+// with, to the channels of rws, the recursive watches wanting dir, if they
+// still exist and reported does not say one was sent to the channel before.
+// It notes the channels sent to in reported.
+func (t *nonrecursiveTree) report(dir string, err error, rws []recwatch, reported map[chan<- EventInfo]bool) {
+	dbgprintf("watchTree: not watching %s: %v", dir, err)
+	t.rw.RLock()
+	defer t.rw.RUnlock()
+	if t.closed {
+		return
 	}
-	dbgprintf("watchTree: %v", pathErr)
-	t.rw.Lock()
-	defer t.rw.Unlock()
-	for _, c := range t.wanting(dir) {
-		if reported[c] {
+	for _, rw := range rws {
+		if _, ok := t.filters[rw]; !ok || reported[rw.c] {
 			continue
 		}
-		reported[c] = true
 		select {
-		case c <- &WatchError{Err: pathErr}:
+		case rw.c <- &WatchError{Dir: dir, Err: err}:
+			reported[rw.c] = true
 		default:
 			dbgprintf("WatchError for %q dropped: receiver too slow", dir)
 		}
 	}
 }
 
-// watchDir watches dir and adds its node to the tree if a recursive watch
-// wants it (see wanting), and returns errSkip if none does or t is closed.
-func (t *nonrecursiveTree) watchDir(dir string) error {
+// watchDir watches dir and adds its node to the tree if recursive watches
+// want it, and returns them (see wanting, which parent is passed to). It
+// returns errSkip if none do or t is closed.
+func (t *nonrecursiveTree) watchDir(dir string, parent []recwatch) ([]recwatch, error) {
 	t.rw.Lock()
 	defer t.rw.Unlock()
-	if t.closed || len(t.wanting(dir)) == 0 {
-		return errSkip
+	if t.closed {
+		return nil, errSkip
+	}
+	rws := t.wanting(dir, parent)
+	if len(rws) == 0 {
+		return nil, errSkip
 	}
 	var nd node
 	eset := internal
@@ -197,30 +214,55 @@ func (t *nonrecursiveTree) watchDir(dir string) error {
 		return nil
 	})
 	if eset == internal {
-		return errSkip
+		return nil, errSkip
 	}
 	if dir != nd.Name {
 		nd = nd.Add(dir)
 	}
 	if err := t.rewatchFunc(eset)(nd); err != nil {
-		return &os.PathError{Op: "watch", Path: dir, Err: err}
+		if _, ok := err.(*os.PathError); !ok {
+			err = &os.PathError{Op: "watch", Path: dir, Err: err}
+		}
+		return rws, err
 	}
-	return nil
+	return rws, nil
 }
 
-// wanting returns the channels of the recursive watches that have dir in
-// their tree: dir is the watch's directory, or below it and not excluded by
-// its DoNotWatchFn. So directories are watched unless every recursive watch
-// they are below excludes them. t.rw must be held for writing, as the
-// DoNotWatchFns need not be safe for concurrent use.
-func (t *nonrecursiveTree) wanting(dir string) []chan<- EventInfo {
-	var cs []chan<- EventInfo
+// wanting returns the recursive watches that have dir in their tree: dir is
+// the watch's directory, or below it with neither dir nor a directory in
+// between excluded by the watch's DoNotWatchFn. So directories are watched
+// unless every recursive watch they are below excludes them. If parent is
+// not nil, it is what wanting returned for dir's parent, so only dir needs
+// checking. t.rw must be held for writing, as DoNotWatchFns need not be safe
+// for concurrent use.
+func (t *nonrecursiveTree) wanting(dir string, parent []recwatch) []recwatch {
+	var rws []recwatch
 	for rw, doNotWatch := range t.filters {
-		if dir == rw.path || indexrel(rw.path, dir) != -1 && (doNotWatch == nil || !doNotWatch(dir)) {
-			cs = append(cs, rw.c)
+		var wants bool
+		switch {
+		case rw.path == dir:
+			wants = true
+		case parent != nil:
+			wants = slices.Contains(parent, rw) && (doNotWatch == nil || !doNotWatch(dir))
+		default:
+			wants = indexrel(rw.path, dir) != -1 && (doNotWatch == nil || !excludes(doNotWatch, rw.path, dir))
+		}
+		if wants {
+			rws = append(rws, rw)
 		}
 	}
-	return cs
+	return rws
+}
+
+// excludes reports whether doNotWatch excludes dir, or a directory between
+// top and dir, which is below top.
+func excludes(doNotWatch DoNotWatchFn, top, dir string) bool {
+	for p := dir; len(p) > len(top); p = filepath.Dir(p) {
+		if doNotWatch(p) {
+			return true
+		}
+	}
+	return false
 }
 
 // watchAdd TODO(rjeczalik)

@@ -43,26 +43,24 @@ func (t *nonrecursiveTree) overflowLoop() {
 //
 // Directory creation events may have been among the lost ones, in which
 // case the created directories were never watched and all future events
-// below them would be lost as well. Therefore every outermost recursive
-// watchpoint's tree is walked again with watchTree, watching every
-// directory in it (rewatchFunc also covers directories recreated at the
-// path of a node left behind by a removed one).
+// below them would be lost as well. Therefore every recursive watch's tree
+// is walked again with watchTree, watching every directory in it
+// (rewatchFunc also covers directories recreated at the path of a node
+// left behind by a removed one). Trees of recursive watches within others
+// are walked twice, but a tree can have parts only an inner watch wants.
 //
 // Since it is unknown which events were lost, every user channel is then
 // notified with an overflowEvent carrying the path of the node it is
 // registered at, prompting a rescan of that subtree. That happens under
 // t.rw, so that no channel is notified once Stop for it has returned.
 func (t *nonrecursiveTree) handleOverflow() {
-	var roots []string
+	roots := make(map[string]bool)
 	t.rw.RLock()
-	t.walkWatchpoint(t.root.nd, func(min Event, nd node) error {
-		if eset := nd.Watch[t.rec]; min&recursive == 0 && eset&recursive != 0 {
-			roots = append(roots, nd.Name)
-		}
-		return nil
-	})
+	for rw := range t.filters {
+		roots[rw.path] = true
+	}
 	t.rw.RUnlock()
-	for _, root := range roots {
+	for root := range roots {
 		t.watchTree(root)
 	}
 

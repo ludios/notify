@@ -14,33 +14,45 @@ import (
 	"time"
 )
 
-// failingSpy is a Spy whose Watch fails with ENOSPC for the paths in fail.
-type failingSpy struct {
+// faultySpy is a Spy watcher, which records Watch calls and never delivers
+// filesystem events, that also fails to watch some paths.
+type faultySpy struct {
 	*Spy
-	fail map[string]bool
+	full      map[string]bool // Watch fails with ENOSPC
+	vanishing map[string]int  // Watch fails with ENOENT so many times, as on kqueue when a file vanishes
 }
 
-func (s failingSpy) Watch(p string, e Event) error {
-	if s.fail[p] {
+func (s faultySpy) Watch(p string, e Event) error {
+	if s.full[p] {
 		return syscall.ENOSPC
+	}
+	if s.vanishing[p] > 0 {
+		s.vanishing[p]--
+		return syscall.ENOENT
 	}
 	return s.Spy.Watch(p, e)
 }
 
-// newSpyTree returns a non-recursive tree over a Spy watcher, which fails to
-// watch the paths in fail, and the channel the watcher would send to. The Spy
-// records Watch calls and never delivers filesystem events, which
-// deterministically simulates the events for directories created after
-// watching being lost in a queue overflow.
-func newSpyTree(t *testing.T, fail ...string) (*nonrecursiveTree, *Spy, chan EventInfo) {
-	spy := failingSpy{Spy: &Spy{}, fail: make(map[string]bool)}
-	for _, p := range fail {
-		spy.fail[p] = true
+// watched reports whether s was asked to watch path.
+func (s faultySpy) watched(path string) bool {
+	for _, call := range *s.Spy {
+		if call.F == FuncWatch && call.P == path {
+			return true
+		}
 	}
+	return false
+}
+
+// newSpyTree returns a non-recursive tree over a faultySpy, and the channel
+// the watcher would send to. As the Spy delivers no events, directories
+// created after watching are as if their events were lost in a queue
+// overflow.
+func newSpyTree(t *testing.T) (*nonrecursiveTree, faultySpy, chan EventInfo) {
+	spy := faultySpy{Spy: &Spy{}, full: make(map[string]bool), vanishing: make(map[string]int)}
 	c := make(chan EventInfo, buffer)
 	tr := newNonrecursiveTree(spy, c, nil)
 	t.Cleanup(func() { tr.Close() })
-	return tr, spy.Spy, c
+	return tr, spy, c
 }
 
 // overflow simulates the watcher's event queue overflowing by sending to c,
@@ -61,16 +73,6 @@ func overflow(t *testing.T, c, user chan EventInfo) []EventInfo {
 			t.Fatalf("timed out waiting for overflow notification; got %v", got)
 		}
 	}
-}
-
-// spyWatched reports whether spy was asked to watch path.
-func spyWatched(spy *Spy, path string) bool {
-	for _, call := range *spy {
-		if call.F == FuncWatch && call.P == path {
-			return true
-		}
-	}
-	return false
 }
 
 func mkdirs(t *testing.T, root string, dirs ...string) {
@@ -99,7 +101,7 @@ func TestOverflow(t *testing.T) {
 	// Created after the initial walk, so as if its mkdir event was lost.
 	lost := filepath.Join(tmp, "b")
 	mkdirs(t, tmp, "b")
-	if spyWatched(spy, lost) {
+	if spy.watched(lost) {
 		t.Fatalf("%q watched before overflow handling; test is broken", lost)
 	}
 
@@ -109,8 +111,8 @@ func TestOverflow(t *testing.T) {
 	}
 	// The overflow notification is sent after the re-walk completed, so
 	// the repair watch must have been recorded by now.
-	if !spyWatched(spy, lost) {
-		t.Fatalf("%q was not watched during overflow recovery; calls: %v", lost, *spy)
+	if !spy.watched(lost) {
+		t.Fatalf("%q was not watched during overflow recovery; calls: %v", lost, *spy.Spy)
 	}
 }
 
@@ -125,19 +127,20 @@ func TestOverflowKeepsFilter(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := filepath.Join(tmp, "other")
-	mkdirs(t, tmp, "ign/deep", "keep", "other/ign")
+	mkdirs(t, tmp, "ign/deep", "keep", "other")
 	if err := tr.Watch(other+"/...", make(chan EventInfo, 16), nil, All); err != nil {
 		t.Fatal(err)
 	}
+	mkdirs(t, tmp, "other/ign")
 
 	overflow(t, c, userCh)
 	for _, d := range []string{"ign", "ign/deep"} {
-		if p := filepath.Join(tmp, d); spyWatched(spy, p) {
+		if p := filepath.Join(tmp, d); spy.watched(p) {
 			t.Errorf("%q is excluded but was watched", p)
 		}
 	}
 	for _, d := range []string{"keep", "other/ign"} {
-		if p := filepath.Join(tmp, d); !spyWatched(spy, p) {
+		if p := filepath.Join(tmp, d); !spy.watched(p) {
 			t.Errorf("%q was not watched", p)
 		}
 	}
@@ -149,7 +152,8 @@ func TestOverflowKeepsFilter(t *testing.T) {
 func TestOverflowReportsWatchErrors(t *testing.T) {
 	tmp := t.TempDir()
 	full, locked := filepath.Join(tmp, "full"), filepath.Join(tmp, "locked")
-	tr, spy, c := newSpyTree(t, full)
+	tr, spy, c := newSpyTree(t)
+	spy.full[full] = true
 	userCh := make(chan EventInfo, 16)
 	if err := tr.Watch(tmp+"/...", userCh, nil, All); err != nil {
 		t.Fatal(err)
@@ -168,15 +172,15 @@ func TestOverflowReportsWatchErrors(t *testing.T) {
 	switch {
 	case !ok:
 		t.Fatalf("got %v; want a WatchError", got[0])
-	case werr.Path() == full && errors.Is(werr.Err, syscall.ENOSPC):
-	case werr.Path() == locked && errors.Is(werr.Err, os.ErrPermission):
+	case werr.Path() == full && errors.Is(werr, syscall.ENOSPC):
+	case werr.Path() == locked && errors.Is(werr, os.ErrPermission):
 	default:
-		t.Fatalf("got WatchError %v", werr.Err)
+		t.Fatalf("got %v", werr)
 	}
-	if spyWatched(spy, filepath.Join(full, "sub")) {
+	if spy.watched(filepath.Join(full, "sub")) {
 		t.Error("the directory that failed to be watched was walked")
 	}
-	if !spyWatched(spy, filepath.Join(tmp, "keep")) {
+	if !spy.watched(filepath.Join(tmp, "keep")) {
 		t.Error("the walk stopped at a failing directory")
 	}
 }
@@ -187,11 +191,11 @@ func TestOverflowReportsWatchErrors(t *testing.T) {
 func TestCloseDuringOverflow(t *testing.T) {
 	tmp := t.TempDir()
 	for i := 0; i < 100; i++ {
-		tr, _, c := newSpyTree(t)
+		c := make(chan EventInfo, buffer)
 		for len(c) < cap(c) {
 			c <- overflowEvent{}
 		}
-		tr.Close()
+		newNonrecursiveTree(&Spy{}, c, nil).Close()
 	}
 
 	tr, spy, _ := newSpyTree(t)
@@ -202,10 +206,74 @@ func TestCloseDuringOverflow(t *testing.T) {
 	mkdirs(t, tmp, "new")
 	tr.Close()
 	tr.handleOverflow()
-	if spyWatched(spy, filepath.Join(tmp, "new")) {
+	if spy.watched(filepath.Join(tmp, "new")) {
 		t.Error("a directory was watched after Close")
 	}
 	if len(userCh) != 0 {
 		t.Errorf("got %v after Close", <-userCh)
+	}
+}
+
+// The trees of recursive watches within others are walked again too, also
+// where the outer watch excludes the directory they are in.
+func TestOverflowWalksInnerWatches(t *testing.T) {
+	tmp := t.TempDir()
+	mkdirs(t, tmp, "ign/deep")
+	tr, spy, c := newSpyTree(t)
+	watch := func(dir string, doNotWatch DoNotWatchFn) chan EventInfo {
+		t.Helper()
+		ch := make(chan EventInfo, 16)
+		if err := tr.Watch(filepath.Join(tmp, dir, "..."), ch, doNotWatch, All); err != nil {
+			t.Fatal(err)
+		}
+		return ch
+	}
+	userCh := watch("", func(p string) bool { return filepath.Base(p) == "ign" })
+	// Stopping this watch leaves ign with the tree's recursive watchpoint.
+	tr.Stop(watch("ign", nil))
+	watch("ign/deep", nil)
+	mkdirs(t, tmp, "ign/deep/new")
+
+	overflow(t, c, userCh)
+	if p := filepath.Join(tmp, "ign/deep/new"); !spy.watched(p) {
+		t.Errorf("%q was not watched", p)
+	}
+}
+
+// A walk that starts below a directory a recursive watch excludes, e.g. for
+// a directory created there, leaves it out of that watch's tree.
+func TestWalkBelowExcludedDir(t *testing.T) {
+	tmp := t.TempDir()
+	mkdirs(t, tmp, "ign/new/sub")
+	tr, spy, _ := newSpyTree(t)
+	doNotWatch := func(p string) bool { return filepath.Base(p) == "ign" }
+	if err := tr.Watch(filepath.Join(tmp, "..."), make(chan EventInfo, 16), doNotWatch, All); err != nil {
+		t.Fatal(err)
+	}
+	tr.watchTree(filepath.Join(tmp, "ign/new"))
+	for _, d := range []string{"ign/new", "ign/new/sub"} {
+		if p := filepath.Join(tmp, d); spy.watched(p) {
+			t.Errorf("%q is below an excluded directory but was watched", p)
+		}
+	}
+}
+
+// Watching a directory is tried again when it fails with ENOENT although the
+// directory exists, as it does on kqueue when a file in it vanishes.
+func TestOverflowRetriesVanishedFile(t *testing.T) {
+	tmp := t.TempDir()
+	tr, spy, c := newSpyTree(t)
+	userCh := make(chan EventInfo, 16)
+	if err := tr.Watch(filepath.Join(tmp, "..."), userCh, nil, All); err != nil {
+		t.Fatal(err)
+	}
+	mkdirs(t, tmp, "busy/sub")
+	spy.vanishing[filepath.Join(tmp, "busy")] = 2
+
+	if got := overflow(t, c, userCh); len(got) != 1 {
+		t.Fatalf("got %v; want only the overflow notification", got)
+	}
+	if p := filepath.Join(tmp, "busy/sub"); !spy.watched(p) {
+		t.Errorf("%q was not watched", p)
 	}
 }

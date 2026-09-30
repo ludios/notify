@@ -20,8 +20,6 @@
 
 package notify
 
-import "os"
-
 var defaultTree = newTree()
 
 type DoNotWatchFn func(string) bool
@@ -71,8 +69,8 @@ type DoNotWatchFn func(string) bool
 // Where the OS watches directories one by one (e.g. inotify), a recursive
 // watchpoint watches directories that appear in its tree after Watch returned.
 // If one cannot be watched or read, e.g. because the inotify watch limit was
-// reached, c is sent a *WatchError, and changes below that directory may go
-// unreported.
+// reached, c is sent a *WatchError (unless c is full), and changes below that
+// directory may go unreported.
 func Watch(path string, c chan<- EventInfo, events ...Event) error {
 	return defaultTree.Watch(path, c, nil, events...)
 }
@@ -81,6 +79,11 @@ func Watch(path string, c chan<- EventInfo, events ...Event) error {
 // files or directories based on the return value of the argument function
 // doNotWatch. Given a path as argument doNotWatch should return true if the
 // file or directory should not be watched.
+//
+// Nothing below a directory doNotWatch excludes is watched. doNotWatch is
+// kept until Stop, for directories that appear later, and then called from
+// notify's goroutines, one call at a time, while it blocks notify's event
+// dispatching; so it must be quick and must not call into notify.
 func WatchWithFilter(path string, c chan<- EventInfo,
 	doNotWatch func(string) bool, events ...Event) error {
 	return defaultTree.Watch(path, c, doNotWatch, events...)
@@ -92,12 +95,15 @@ func WatchWithFilter(path string, c chan<- EventInfo,
 // Such a channel is sent one WatchError at most for each time directories
 // are looked for in the tree (see Watch).
 type WatchError struct {
-	Err *os.PathError // what failed, for which directory
+	Dir string // the directory not watched, nor anything below it
+	Err error  // why, e.g. an *os.PathError from watching Dir
 }
 
-func (e *WatchError) Event() Event     { return 0 }
-func (e *WatchError) Path() string     { return e.Err.Path }
-func (e *WatchError) Sys() interface{} { return nil }
+func (e *WatchError) Event() Event  { return 0 }
+func (e *WatchError) Path() string  { return e.Dir }
+func (e *WatchError) Sys() any      { return nil }
+func (e *WatchError) Error() string { return "notify: not watching " + e.Dir + ": " + e.Err.Error() }
+func (e *WatchError) Unwrap() error { return e.Err }
 
 // Stop removes all watchpoints registered for c. All underlying watches are
 // also removed, for which c was the last channel listening for events.
