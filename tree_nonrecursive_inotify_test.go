@@ -12,6 +12,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 )
@@ -109,13 +110,23 @@ func (f *recreateFixture) write(rel string) {
 	f.do(os.WriteFile(f.path(rel), []byte("x"), 0644))
 }
 
-// watchedPaths returns how many inotify descriptors are recorded for each path.
+// watchedPaths returns how many inotify descriptors are recorded for each
+// path, checking that the index by path agrees.
 func (f *recreateFixture) watchedPaths() map[string]int {
+	f.t.Helper()
 	f.w.RLock()
 	defer f.w.RUnlock()
 	paths := make(map[string]int)
-	for _, wd := range f.w.m {
+	for iwd, wd := range f.w.m {
 		paths[wd.path]++
+		if !slices.Contains(f.w.wds[wd.path], iwd) {
+			f.t.Fatalf("descriptor %d for %s is not indexed by path: %v", iwd, wd.path, f.w.wds)
+		}
+	}
+	for path, iwds := range f.w.wds {
+		if len(iwds) != paths[path] {
+			f.t.Fatalf("path %s indexed with descriptors %v, but %d recorded", path, iwds, paths[path])
+		}
 	}
 	return paths
 }
@@ -147,6 +158,7 @@ func TestRenamedDirPathIsRewatched(t *testing.T) {
 	f.writeUntilEvent("new/sub/file")
 	f.do(os.Mkdir(f.path("old"), 0755))
 	f.writeUntilEvent("old/file")
+	f.watchedPaths()
 }
 
 // Removed directories must not leave their descriptors behind.

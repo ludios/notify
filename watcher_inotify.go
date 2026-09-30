@@ -13,6 +13,7 @@ import (
 	"errors"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"unsafe"
@@ -42,8 +43,9 @@ type watched struct {
 
 // inotify implements Watcher interface.
 type inotify struct {
-	sync.RWMutex                       // protects inotify.m map
+	sync.RWMutex                       // protects inotify.m and inotify.wds maps
 	m            map[int32]*watched    // watch descriptor to watched object
+	wds          map[string][]int32    // path to its watch descriptors in m
 	fd           int32                 // inotify file descriptor
 	pipefd       []int                 // pipe's read and write descriptors
 	epfd         int                   // epoll descriptor
@@ -57,6 +59,7 @@ type inotify struct {
 func newWatcher(c chan<- EventInfo) watcher {
 	i := &inotify{
 		m:      make(map[int32]*watched),
+		wds:    make(map[string][]int32),
 		fd:     invalidDescriptor,
 		pipefd: []int{invalidDescriptor, invalidDescriptor},
 		epfd:   invalidDescriptor,
@@ -100,14 +103,29 @@ func (i *inotify) watch(path string, e Event) (err error) {
 		i.Unlock()
 		return
 	}
-	if wd, ok := i.m[int32(iwd)]; !ok {
-		i.m[int32(iwd)] = &watched{path: path, mask: uint32(e)}
-	} else {
-		wd.path = path
-		wd.mask = uint32(e)
-	}
+	// The descriptor is known already if the directory is watched, maybe
+	// under another path it was renamed from.
+	i.forget(int32(iwd))
+	i.m[int32(iwd)] = &watched{path: path, mask: uint32(e)}
+	i.wds[path] = append(i.wds[path], int32(iwd))
 	i.Unlock()
 	return nil
+}
+
+// forget drops watch descriptor iwd from i.m and i.wds, if it is there. i
+// must be locked.
+func (i *inotify) forget(iwd int32) {
+	wd, ok := i.m[iwd]
+	if !ok {
+		return
+	}
+	delete(i.m, iwd)
+	iwds := slices.DeleteFunc(i.wds[wd.path], func(x int32) bool { return x == iwd })
+	if len(iwds) == 0 {
+		delete(i.wds, wd.path)
+	} else {
+		i.wds[wd.path] = iwds
+	}
 }
 
 // lazyinit sets up all required file descriptors and starts 1+consumersCount
@@ -290,7 +308,7 @@ func (i *inotify) transform(es []*event) []*event {
 	i.Lock()
 	for idx, e := range es {
 		if e.sys.Mask&unix.IN_IGNORED != 0 {
-			delete(i.m, e.sys.Wd)
+			i.forget(e.sys.Wd)
 		}
 		if e.sys.Mask&(unix.IN_IGNORED|unix.IN_Q_OVERFLOW) != 0 {
 			es[idx] = nil
@@ -369,13 +387,8 @@ func decode(mask Event, e *event) (syse *event) {
 // tree keeps its watch under its old path, and a directory created there
 // later gets another. It returns errNotWatched if there are none.
 func (i *inotify) Unwatch(path string) (err error) {
-	var iwds []int32
 	i.RLock()
-	for iwd, wd := range i.m {
-		if wd.path == path {
-			iwds = append(iwds, iwd)
-		}
-	}
+	iwds := slices.Clone(i.wds[path])
 	i.RUnlock()
 	if len(iwds) == 0 {
 		return errNotWatched
@@ -389,7 +402,7 @@ func (i *inotify) Unwatch(path string) (err error) {
 			continue
 		}
 		i.Lock()
-		delete(i.m, iwd)
+		i.forget(iwd)
 		i.Unlock()
 	}
 	return err
@@ -409,7 +422,7 @@ func (i *inotify) Close() (err error) {
 		if e := removeInotifyWatch(i.fd, iwd); e != nil && err == nil {
 			err = e
 		}
-		delete(i.m, iwd)
+		i.forget(iwd)
 	}
 	switch _, errwrite := unix.Write(i.pipefd[1], []byte{0x00}); {
 	case errwrite != nil && err == nil:
