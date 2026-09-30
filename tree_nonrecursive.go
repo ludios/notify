@@ -110,21 +110,33 @@ func (t *nonrecursiveTree) dispatch(c <-chan EventInfo) {
 func (t *nonrecursiveTree) internal(rec <-chan EventInfo) {
 	for ei := range rec {
 		if ei.Event() == Remove {
-			t.rw.Lock()
-			nd, err := t.root.Get(ei.Path())
-			if err != nil {
-				t.rw.Unlock()
-				continue
-			}
-			t.walkWatchpoint(nd, func(_ Event, nd node) error {
-				t.w.Unwatch(nd.Name)
-				return nil
-			})
-			t.root.Del(ei.Path())
-			t.rw.Unlock()
+			t.remove(ei.Path())
 			continue
 		}
 		t.watchTree(ei.Path())
+	}
+}
+
+// remove forgets dir, which was removed, and everything below it: unwatches
+// them, and deletes their nodes and the recursive watches of them. It does
+// nothing if a directory was made at dir since, which the overflow re-walk
+// may have watched already.
+func (t *nonrecursiveTree) remove(dir string) {
+	t.rw.Lock()
+	defer t.rw.Unlock()
+	nd, err := t.root.Get(dir)
+	if err != nil || !dirGone(dir) {
+		return
+	}
+	t.walkWatchpoint(nd, func(_ Event, nd node) error {
+		t.w.Unwatch(nd.Name)
+		return nil
+	})
+	t.root.Del(dir)
+	for rw := range t.filters {
+		if rw.path == dir || indexrel(dir, rw.path) != -1 {
+			delete(t.filters, rw)
+		}
 	}
 }
 

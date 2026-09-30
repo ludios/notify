@@ -277,3 +277,38 @@ func TestOverflowRetriesVanishedFile(t *testing.T) {
 		t.Errorf("%q was not watched", p)
 	}
 }
+
+// A removed directory is forgotten along with the recursive watches of it,
+// unless a directory was made at its path by the time that is handled.
+func TestRemove(t *testing.T) {
+	tmp := t.TempDir()
+	back, gone := filepath.Join(tmp, "back"), filepath.Join(tmp, "gone")
+	mkdirs(t, tmp, "back", "gone")
+	tr, spy, _ := newSpyTree(t)
+	doNotWatch := func(p string) bool { return p == gone }
+	if err := tr.Watch(filepath.Join(tmp, "..."), make(chan EventInfo, 16), doNotWatch, All); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Watch(filepath.Join(gone, "..."), make(chan EventInfo, 16), nil, All); err != nil {
+		t.Fatal(err)
+	}
+
+	// back was removed and made again before its removal is handled.
+	tr.remove(back)
+	for _, call := range *spy.Spy {
+		if call.F == FuncUnwatch && call.P == back {
+			t.Errorf("%q was unwatched although it exists", back)
+		}
+	}
+
+	if err := os.Remove(gone); err != nil {
+		t.Fatal(err)
+	}
+	tr.remove(gone)
+	mkdirs(t, tmp, "gone")
+	*spy.Spy = nil
+	tr.watchTree(gone)
+	if spy.watched(gone) {
+		t.Errorf("%q was watched for a watch of it that was removed with it", gone)
+	}
+}
