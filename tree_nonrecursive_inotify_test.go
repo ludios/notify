@@ -227,3 +227,14 @@ func TestNewDirWatchError(t *testing.T) {
 		}
 	}
 }
+
+// A closed inotify watcher must not start again, e.g. for Watch on the tree:
+// it would send events on the tree's closed channel.
+func TestWatchAfterClose(t *testing.T) {
+	c := make(chan EventInfo, buffer)
+	tree := newNonrecursiveTree(newWatcher(c), c, nil)
+	tree.Close()
+	if err := tree.Watch(filepath.Join(t.TempDir(), "..."), make(chan EventInfo, 1), nil, All); err == nil {
+		t.Fatal("Watch after Close succeeded")
+	}
+}

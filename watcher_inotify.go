@@ -43,9 +43,10 @@ type watched struct {
 
 // inotify implements Watcher interface.
 type inotify struct {
-	sync.RWMutex                       // protects inotify.m and inotify.wds maps
+	sync.RWMutex                       // protects inotify.m, inotify.wds and inotify.closed
 	m            map[int32]*watched    // watch descriptor to watched object
 	wds          map[string][]int32    // path to its watch descriptors in m
+	closed       bool                  // set by Close, after which lazyinit fails
 	fd           int32                 // inotify file descriptor
 	pipefd       []int                 // pipe's read and write descriptors
 	epfd         int                   // epoll descriptor
@@ -138,6 +139,10 @@ func (i *inotify) lazyinit() error {
 		i.Lock()
 		defer i.Unlock()
 		if atomic.LoadInt32(&i.fd) == invalidDescriptor {
+			// Starting anew would send on c, which may be closed by now.
+			if i.closed {
+				return errClosed
+			}
 			fd, err := unix.InotifyInit1(unix.IN_CLOEXEC)
 			if err != nil {
 				return err
@@ -414,6 +419,7 @@ func (i *inotify) Unwatch(path string) (err error) {
 // all operations on current monitoring instance are done.
 func (i *inotify) Close() (err error) {
 	i.Lock()
+	i.closed = true
 	if fd := atomic.LoadInt32(&i.fd); fd == invalidDescriptor {
 		i.Unlock()
 		return nil

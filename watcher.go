@@ -1,3 +1,4 @@
+// Model-output: Claude Opus 5.5
 // Copyright (c) 2014-2015 The Notify Authors. All rights reserved.
 // Use of this source code is governed by the MIT license that can be
 // found in the LICENSE file.
@@ -10,6 +11,7 @@ var (
 	errAlreadyWatched  = errors.New("path is already watched")
 	errNotWatched      = errors.New("path is not being watched")
 	errInvalidEventSet = errors.New("invalid event set provided")
+	errClosed          = errors.New("watcher is closed")
 )
 
 // Watcher is a intermediate interface for wrapping inotify, ReadDirChangesW,
