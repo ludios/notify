@@ -12,9 +12,8 @@ import (
 	"testing"
 )
 
-// AddDir must keep walking when entries disappear between reading a
-// directory and looking at them, as git's temporary object and lock files
-// routinely do.
+// AddDir must keep walking when directories disappear between reading their
+// parent and watching them, as git's gc does to .git/objects/xx.
 func TestAddDirSkipsVanishedEntries(t *testing.T) {
 	root := t.TempDir()
 	for _, d := range []string{"keep/a", "keep/b", "gone/sub", "later"} {
@@ -22,16 +21,12 @@ func TestAddDirSkipsVanishedEntries(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	tmp := filepath.Join(root, "keep", "tmp_obj")
-	if err := os.WriteFile(tmp, nil, 0644); err != nil {
-		t.Fatal(err)
-	}
 
-	// doNotWatch runs after readdir and before lstat, so removing the entry
-	// it is asked about makes lstat fail with ENOENT.
-	vanish := map[string]bool{tmp: true, filepath.Join(root, "gone"): true}
+	// doNotWatch runs after the parent is read, so removing the directory it
+	// is asked about makes fn fail on it, as watching it would.
+	gone := filepath.Join(root, "gone")
 	doNotWatch := func(p string) bool {
-		if vanish[p] {
+		if p == gone {
 			if err := os.RemoveAll(p); err != nil {
 				t.Fatal(err)
 			}
@@ -40,6 +35,9 @@ func TestAddDirSkipsVanishedEntries(t *testing.T) {
 	}
 	var visited []string
 	fn := func(nd node) error {
+		if _, err := os.Lstat(nd.Name); err != nil {
+			return err
+		}
 		rel, _ := filepath.Rel(root, nd.Name)
 		visited = append(visited, filepath.ToSlash(rel))
 		return nil

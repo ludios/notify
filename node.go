@@ -40,16 +40,13 @@ func newnode(name string) node {
 	}
 }
 
-// vanished reports whether err means that a path found by an earlier
-// readdir no longer exists, or is no longer a directory.
-func vanished(err error) bool {
-	return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
-}
-
 // dirGone reports whether path no longer exists or is no longer a directory.
 func dirGone(path string) bool {
 	fi, err := os.Lstat(path)
-	return vanished(err) || err == nil && !fi.IsDir()
+	if err != nil {
+		return errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENOTDIR)
+	}
+	return !fi.IsDir()
 }
 
 func (nd node) addchild(name, base string) node {
@@ -73,10 +70,10 @@ func (nd node) Add(name string) node {
 	return nd.addchild(name, name[i:])
 }
 
-// AddDir calls fn for nd and every directory below it on disk, adding tree
-// nodes for directories that have none. Entries that vanish during the walk
-// (e.g. temporary files renamed into place, directories removed concurrently)
-// are skipped; any other error, or nd itself vanishing, stops the walk.
+// AddDir calls fn for nd and every directory below it on disk that doNotWatch
+// (if not nil) does not exclude, adding tree nodes for directories that have
+// none. Directories that vanish during the walk are skipped; any other error,
+// or nd itself vanishing, stops the walk.
 func (nd node) AddDir(fn walkFunc, doNotWatch DoNotWatchFn) error {
 	top := nd.Name
 	// Errors from fn cannot tell which path they are about (on kqueue, fn
@@ -99,40 +96,44 @@ Traverse:
 		}
 		// TODO(rjeczalik): tolerate open failures - add failed names to
 		// AddDirError and notify users which names are not added to the tree.
-		f, err := os.Open(nd.Name)
+		names, err := subdirs(nd.Name)
 		if err != nil {
-			if gone(nd) {
-				continue Traverse
-			}
-			return err
-		}
-		names, err := f.Readdirnames(-1)
-		f.Close()
-		if err != nil {
-			// Reading a directory removed since it was opened fails with ENOENT.
 			if gone(nd) {
 				continue Traverse
 			}
 			return err
 		}
 		for _, name := range names {
-			name = filepath.Join(nd.Name, name)
-			if doNotWatch != nil && doNotWatch(name) {
-				continue
-			}
-			fi, err := os.Lstat(name)
-			if vanished(err) {
-				continue
-			}
-			if err != nil {
-				return err
-			}
-			if fi.Mode()&(os.ModeSymlink|os.ModeDir) == os.ModeDir {
-				stack = append(stack, nd.addchild(name, name[len(nd.Name)+1:]))
+			path := filepath.Join(nd.Name, name)
+			if doNotWatch == nil || !doNotWatch(path) {
+				stack = append(stack, nd.addchild(path, name))
 			}
 		}
 	}
 	return nil
+}
+
+// subdirs returns the names of the directories in dir, not counting symlinks
+// to directories. It fails if dir is removed while being read.
+func subdirs(dir string) ([]string, error) {
+	f, err := os.Open(dir)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	// The type of an entry mostly comes with its name, so this rarely needs
+	// lstat(2); entries that vanish before one are left out.
+	entries, err := f.ReadDir(-1)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	return names, nil
 }
 
 func (nd node) Get(name string) (node, error) {
